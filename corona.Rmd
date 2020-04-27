@@ -1,0 +1,230 @@
+---
+title: "corona"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r}
+#read corona
+  
+library(ggplot2)
+library(dplyr)
+library(plotly)
+par(family= "HiraKakuProN-W3")
+df<-read.csv("https://dl.dropboxusercontent.com/s/6mztoeb6xf78g5w/COVID-19.csv",header=T)
+df_daily <- df %>% 
+  filter(居住都道府県=="東京都") %>%
+  mutate(確定日=as.POSIXct(確定日, format='%m/%d/%Y')) %>% 
+  group_by(確定日) %>% 
+  summarize(陽性人数=sum(人数,na.rm=T), 退院人数=sum(退院数,na.rm=T)) 
+ds<-data.frame(確定日=(seq(min(df_daily$確定日), max(df_daily$確定日), by = "day")))
+ds %>% full_join(df_daily,by="確定日")-> ds2
+ds2[is.na(ds2)]=0
+ds2 %>%
+  mutate(陽性累積=cumsum(陽性人数)) %>% 
+  mutate(退院累積=cumsum(退院人数)) %>%
+  mutate(前週陽性=lag(陽性人数,7)) %>%
+  mutate(陽性増割合=陽性人数/陽性累積 * 100) %>%
+  mutate(退院増割合=退院人数/退院累積 * 100) %>% 
+  mutate(R0 = 陽性増割合/退院増割合) ->df_daily
+
+ds<-data.frame(確定日=(seq(min(df_daily$確定日), max(df_daily$確定日), by = "day")))
+ds %>% full_join(df_daily,by="確定日")-> ds2
+ds2[is.na(ds2)]=0
+#S0=126010000 #日本人口
+#S0=5281000 #北海道
+S0=13942856 #東京都
+#S0=8822492 #大阪
+#S0=5457201 #兵庫
+df_daily %>% 
+  mutate(beta=陽性人数/(陽性累積*(S0-陽性累積))*S0) %>%
+  mutate(gamma=退院人数/前週陽性) %>%
+  mutate(R0=beta*(S0-陽性累積)/gamma/S0) -> df_SIR
+
+#df_daily %>% mutate(退院人数=ifelse(退院人数==0,NA,退院人数)) -> df_daily
+g1<- ggplot(data=df_daily, aes(x=確定日, y=陽性人数)) + 
+  geom_point() + 
+  #scale_y_log10() + 
+  geom_smooth() + 
+  geom_point(aes(x=確定日,y=退院人数), color="red") + 
+  theme_bw(base_family = "HiraKakuProN-W3")
+plot(g1)
+g2<- ggplot(data=df_daily) + 
+#  geom_line(aes(x=確定日, y=陽性増割合/100), color="green") +
+#  geom_line(aes(x=確定日, y=退院増割合/100), color="pink") + 
+  geom_point(aes(x=確定日, y=R0), color="purple") +
+  geom_smooth(aes(x=確定日, y=R0)) +
+#  scale_y_log10() + 
+  ylim(0,4) +
+  xlab("月日") +
+  ylab("再生産係数") +
+  theme_bw(base_family = "HiraKakuProN-W3")
+plot(g2)
+g3 <- ggplot(data=df_SIR) + 
+  geom_point(aes(x=確定日, y=R0), color="purple") +
+  geom_point(aes(x=確定日, y=gamma), color="red") + 
+  geom_point(aes(x=確定日, y=beta), color="blue") +
+  geom_smooth(aes(x=確定日, y=R0)) +
+  scale_y_log10() + 
+  xlab("月日") +
+  ylab("再生産係数") +
+  theme_bw(base_family = "HiraKakuProN-W3")
+plot(g3)
+
+library(rstan)
+# 計算の高速化
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+
+# データの準備
+data_stan <- list(
+  I_obs = df_SIR$陽性累積,
+  R_obs = df_SIR$退院累積,
+  n_sample = nrow(df_SIR),
+  S0=S0, 
+  R_lag=21
+)
+fit_stan_growth <- stan(
+  file = "SIR.stan",
+  data = data_stan,
+  iter = 20000,
+  thin = 10,
+  chains = 4,
+  seed = 1,
+  control=list(max_treedepth=20)
+)
+
+pairs(fit_stan_growth, pars=c("gamma","beta[1]","beta[44]","beta[43]"))
+options(max.print=100000)
+print(fit_stan_growth, digits=2, probs=c(0.025, 0.5,0.975), pars=c("gamma","beta[10]","I_sta[40]","lp__"))
+# 結果の出力
+print(
+  fit_stan_growth,
+  digits = 2,
+  probs = c(0.025, 0.5, 0.975),
+  pars = c("gamma", "I_sta[45]","R_sta[45]","I_sta[1]")
+)
+traceplot(fit_stan_growth,pars=c("s_I","beta[30]","gamma","lp__"))
+
+sampling_result <- rstan::extract(fit_stan_growth)
+quantile(sampling_result$gamma, probs = c(0.1, 0.5, 0.9))
+quantile(sampling_result$beta[44], probs = c(0.1, 0.5, 0.9))
+gamma_fit_0 <- 0.06222666
+model_I_sta <- t(apply(
+  X=sampling_result$I_sta,
+  MARGIN=2,
+  FUN=quantile,
+  probs=c(0.025,0.5,0.975)
+))
+colnames(model_I_sta)<-c("I_sta_lwr","I_sta_fit","I_sta_upr")
+model_R_sta <- t(apply(
+  X=sampling_result$R_sta,
+  MARGIN=2,
+  FUN=quantile,
+  probs=c(0.025,0.5,0.975)
+))
+colnames(model_R_sta)<-c("R_sta_lwr","R_sta_fit","R_sta_upr")
+model_beta <- t(apply(
+  X=sampling_result$beta,
+  MARGIN=2,
+  FUN=quantile,
+  probs=c(0.025,0.5,0.975)
+))
+colnames(model_beta)<-c("beta_lwr","beta_fit","beta_upr")
+model_R_param <- t(apply(
+  X=sampling_result$R_param,
+  MARGIN=2,
+  FUN=quantile,
+  probs=c(0.025,0.5,0.975)
+))
+colnames(model_R_param)<-c("R_param_lwr","R_param_fit","R_param_upr")
+gamma_fit=quantile(sampling_result$gamma, probs = c(0.5))
+stan_df <- cbind(
+  data.frame(I_sta=df_SIR$陽性累積, R_sta=df_SIR$退院累積, time=df_SIR$確定日),
+  as.data.frame(model_I_sta),
+  as.data.frame(model_R_sta),
+  as.data.frame(model_beta), 
+  as.data.frame(model_R_param)
+)
+stan_df %>%
+  mutate(R0=beta_fit*(1-I_sta/S0-R_sta/S0)/gamma_fit) %>%
+  mutate(I_dif = I_sta_fit - lag(I_sta_fit)) %>%
+  mutate(R_dif = R_sta_fit - lag(R_sta_fit)) %>%
+  mutate(R_dif_prev = lag(R_dif,n=7))        %>%
+#  mutate(gamma_mod = gamma_fit*R_dif/R_dif_prev) %>%
+#  mutate(gamma_mod=gamma_fit*R_dif/R_dif) %>%
+  mutate(gamma_mod=gamma_fit_0) %>%
+  mutate(R0_mod = beta_fit*(1-I_sta/S0-R_sta/S0)/gamma_mod) -> stan_df
+
+g1=ggplot(data=stan_df, aes(x=time,y=I_sta))+
+  labs(title="コロナウイルス推移")+
+  geom_point(alpha=0.6, size=0.9)+
+  geom_line(aes(y=I_sta_fit),size=1.2,color="red")+
+  geom_ribbon(aes(ymin=I_sta_lwr,ymax=I_sta_upr),alpha=0.3)+
+  geom_point(aes(x=time,y=R_sta),alpha=0.6, size=0.9,color="purple")+
+  geom_line(aes(y=R_sta_fit),size=1.2,color="blue")+
+  geom_ribbon(aes(ymin=R_sta_lwr,ymax=R_sta_upr),alpha=0.3)+
+  xlab("月日") +
+  ylab("患者数推定・退院数推定") +
+  theme_bw(base_family = "HiraKakuProN-W3")
+ggplotly(g1)
+ggplot(data=stan_df, aes(x=time,y=R0_mod)) + geom_line() + 
+      geom_line(aes(x=time,y=R_param_fit), color="green") +
+      geom_ribbon(aes(ymin=R_param_lwr,ymax=R_param_upr),alpha=0.3)+
+      geom_line(aes(x=time,y=1), color="red") +
+       ylim(0,10)
+gg5<-ggplot(data=stan_df, aes(x=time,y=beta_fit)) + geom_line() +
+  geom_ribbon(aes(ymin=beta_lwr,ymax=beta_upr),alpha=0.3) +
+  geom_line(data=stan_df,aes(x=time,y=gamma_mod),color="red") + 
+  ylim(0,0.7)
+ggplotly(gg5)
+plot(gg5)
+g6<-ggplot(data=stan_df, aes(x=time,y=I_dif)) + geom_line(color="red") +
+  geom_point(data=df_SIR, aes(x=確定日, y=陽性人数),color="red") + 
+  geom_line(data=stan_df,aes(x=time,y=R_dif),color="blue") + 
+  geom_point(data=df_SIR, aes(x=確定日, y=退院人数),color="blue") +
+  geom_line(data=stan_df,aes(x=time,y=beta_fit*100),color="black") +
+  geom_line(data=stan_df,aes(x=time,y=gamma_mod*100),color="black",linetype="dashed")+
+  xlab("date(m dd)") +
+  ylab("発症者(赤), 回復者(青)") +
+  scale_y_continuous(
+    limits = c(0, 100),
+    sec.axis = sec_axis(~ . /100 , name = "beta(black),gamma(dashed black)")
+  ) +
+  scale_color_hue(name = "", label = c("陽性人数", "退院人数", "beta")) +
+  theme_bw(base_family = "HiraKakuProN-W3")
+
+plot(g6)
+ggplotly(g6)
+
+Rratio=50
+R_mod=gamma_fit/gamma_fit_0
+g7<-ggplot(data=stan_df, aes(x=time,y=I_dif)) + geom_line(color="red") +
+  geom_point(data=df_SIR, aes(x=確定日, y=陽性人数),color="red") + 
+  geom_line(data=stan_df,aes(x=time,y=R_dif),color="blue") + 
+  geom_point(data=df_SIR, aes(x=確定日, y=退院人数),color="blue") +
+  geom_line(data=stan_df,aes(x=time,y=R_param_fit*R_mod*Rratio),color="black") + 
+  geom_ribbon(data=stan_df,aes(ymax=R_param_upr*R_mod*Rratio,ymin=R_param_lwr*R_mod*Rratio), alpha=0.3) +
+  geom_line(data=stan_df,aes(x=time,y=1.0*Rratio),color="black",linetype="dashed")+
+  xlab("date(m dd)") +
+  ylab("発症者(赤), 回復者(青)") +
+  scale_y_continuous(
+    limits = c(0, 250),
+    sec.axis = sec_axis(~ . /Rratio , name = "R(black)")
+  ) +
+  scale_color_hue(name = "", label = c("陽性人数", "退院人数", "beta")) +
+  theme_bw(base_family = "HiraKakuProN-W3") +
+  labs(title="東京都コロナウイルス感染者・回復者・基本再生産数")
+ggplotly(g7)
+plot(g7)
+ggsave(plot=g7,file=paste0("東京R_",format(Sys.Date(),"%Y%m%d"),".png"))
+stan_df$R_param_fit*R_mod
+
+```
+
