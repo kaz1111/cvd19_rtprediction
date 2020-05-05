@@ -10,12 +10,14 @@ knitr::opts_chunk$set(echo = TRUE)
 
 
 ```{r}
-#read corona
-  
+#read corona week
+
 library(ggplot2)
 library(dplyr)
 library(plotly)
+library(lubridate)
 par(family= "HiraKakuProN-W3")
+#df<-read.csv("https://stopcovid19.metro.tokyo.lg.jp/data/130001_tokyo_covid19_patients.csv",header=T)
 df<-read.csv("https://dl.dropboxusercontent.com/s/6mztoeb6xf78g5w/COVID-19.csv",header=T)
 df_daily <- df %>% 
   filter(居住都道府県=="東京都") %>%
@@ -42,6 +44,7 @@ S0=13942856 #東京都
 #S0=8822492 #大阪
 #S0=5457201 #兵庫
 df_daily %>% 
+  mutate(Wd=wday(確定日)) %>%   #1:日曜日
   mutate(beta=陽性人数/(陽性累積*(S0-陽性累積))*S0) %>%
   mutate(gamma=退院人数/前週陽性) %>%
   mutate(R0=beta*(S0-陽性累積)/gamma/S0) -> df_SIR
@@ -88,12 +91,13 @@ data_stan <- list(
   R_obs = df_SIR$退院累積,
   n_sample = nrow(df_SIR),
   S0=S0, 
-  R_lag=21
+  R_lag=21,
+  Wd = df_SIR$Wd
 )
 fit_stan_growth <- stan(
   file = "SIR.stan",
   data = data_stan,
-  iter = 20000,
+  iter = 10000,
   thin = 10,
   chains = 4,
   seed = 1,
@@ -103,6 +107,7 @@ fit_stan_growth <- stan(
 pairs(fit_stan_growth, pars=c("gamma","beta[1]","beta[44]","beta[43]"))
 options(max.print=100000)
 print(fit_stan_growth, digits=2, probs=c(0.025, 0.5,0.975), pars=c("gamma","beta[10]","I_sta[40]","lp__"))
+print(fit_stan_growth, digits=2, probs=c(0.025, 0.5,0.975), pars=c("beta_wd"))
 # 結果の出力
 print(
   fit_stan_growth,
@@ -145,6 +150,14 @@ model_R_param <- t(apply(
 ))
 colnames(model_R_param)<-c("R_param_lwr","R_param_fit","R_param_upr")
 gamma_fit=quantile(sampling_result$gamma, probs = c(0.5))
+model_beta_wd<- t(apply(
+  X=sampling_result$beta_wd,
+  MARGIN=2,
+  FUN=quantile,
+  probs=c(0.025,0.5,0.975)
+))
+colnames(model_beta_wd)<-c("beta_wd_lwr","beta_wd_fit","beta_wd_upr")
+base_beta_wd=mean(model_beta_wd[,'beta_wd_fit'])
 stan_df <- cbind(
   data.frame(I_sta=df_SIR$陽性累積, R_sta=df_SIR$退院累積, time=df_SIR$確定日),
   as.data.frame(model_I_sta),
@@ -153,6 +166,7 @@ stan_df <- cbind(
   as.data.frame(model_R_param)
 )
 stan_df %>%
+  mutate(base_beta_wd=base_beta_wd) %>%
   mutate(R0=beta_fit*(1-I_sta/S0-R_sta/S0)/gamma_fit) %>%
   mutate(I_dif = I_sta_fit - lag(I_sta_fit)) %>%
   mutate(R_dif = R_sta_fit - lag(R_sta_fit)) %>%
@@ -160,7 +174,7 @@ stan_df %>%
 #  mutate(gamma_mod = gamma_fit*R_dif/R_dif_prev) %>%
 #  mutate(gamma_mod=gamma_fit*R_dif/R_dif) %>%
   mutate(gamma_mod=gamma_fit_0) %>%
-  mutate(R0_mod = beta_fit*(1-I_sta/S0-R_sta/S0)/gamma_mod) -> stan_df
+  mutate(R0_mod = (beta_fit+base_beta_wd)*(1-I_sta/S0-R_sta/S0)/gamma_mod) -> stan_df
 
 g1=ggplot(data=stan_df, aes(x=time,y=I_sta))+
   labs(title="コロナウイルス推移")+
@@ -220,11 +234,13 @@ g7<-ggplot(data=stan_df, aes(x=time,y=I_dif)) + geom_line(color="red") +
   ) +
   scale_color_hue(name = "", label = c("陽性人数", "退院人数", "beta")) +
   theme_bw(base_family = "HiraKakuProN-W3") +
-  labs(title="東京都コロナウイルス感染者・回復者・基本再生産数")
+  labs(title="東京都コロナウイルス感染者・回復者・基本再生産数(wd)")
 ggplotly(g7)
 plot(g7)
-ggsave(plot=g7,file=paste0("東京R_",format(Sys.Date(),"%Y%m%d"),".png"))
+ggsave(plot=g7,file=paste0("東京Rwd_",format(Sys.Date(),"%Y%m%d"),".png"))
 stan_df$R_param_fit*R_mod
+stan_df$R0_mod
+
 
 ```
 
